@@ -61,6 +61,31 @@ end
 
 
 ## cached compilation
+disk_cache() = parse(Bool, @load_preference("disk_cache", "false"))
+
+"""
+    enable_cache!(state::Bool=true)
+
+Activate the GPUCompiler disk cache in the current environment.
+You will need to restart your Julia environment for it to take effect.
+
+!!! note
+    The cache functionality requires Julia 1.11
+"""
+function enable_cache!(state::Bool=true)
+    @set_preferences!("disk_cache"=>string(state))
+end
+
+cache_path() = @get_scratch!("cache")
+clear_disk_cache!() = rm(cache_path(); recursive=true, force=true)
+function cache_path(key)
+    return joinpath(
+        cache_path(),
+        # TODO: Use object_build_id from https://github.com/JuliaLang/julia/pull/53943
+        #       Should we disk cache "runtime compilation".
+        string(Base.module_build_id(GPUCompiler)), # captures dependencies as well
+        string(cache_key), "ir.jls")
+end
 
 const cache_lock = ReentrantLock()
 
@@ -115,18 +140,41 @@ end
 
     # fast path: find an applicable CodeInstance and see if we have compiled it before
     ci = ci_cache_lookup(ci_cache(job), src, world, world)::Union{Nothing,CodeInstance}
-    if ci !== nothing && haskey(cache, ci)
-        obj = cache[ci]
+    if ci !== nothing
+        obj = get(cache, ci, nothing)
     end
 
     # slow path: compile and link
     if obj === nothing || compile_hook[] !== nothing
-        # TODO: consider loading the assembly from an on-disk cache here
-        asm = compiler(job)
-
         if obj !== nothing
             # we got here because of a *compile* hook; don't bother linking
             return obj
+        end
+        asm = nothing
+        @static if VERSION >= v"1.11.0-" && disk_cache()
+            cache_key = Base.objectid(ci)
+            path = cache_path(cache_key)
+            if isfile(path)
+                try
+                    @debug "Loading compiled kernel for $spec from $path"
+                    asm = deserialize(path)
+                catch ex
+                    @warn "Failed to load compiled kernel at $path" exception=(ex, catch_backtrace())
+                end
+            end
+        else
+
+        if asm === nothing
+            asm = compiler(job)
+        end
+
+        @static if VERSION >= v"1.11.0-" && disk_cache() && !isfile(path)
+            # TODO: Should we only write out during precompilation?
+            tmppath, io = mktemp(;cleanup=false)
+            serialize(io, asm)
+            close(io)
+            # atomic move
+            Base.rename(tmppath, path, force=true)
         end
 
         obj = linker(job, asm)
